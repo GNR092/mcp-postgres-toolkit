@@ -7,7 +7,7 @@ from fastmcp import FastMCP
 from psycopg2.extras import RealDictCursor
 from psycopg2 import sql
 
-app = FastMCP("mcpservertools")
+app = FastMCP("mcp-postgres-toolkit")
 ACTIVE_DATABASE: Optional[str] = None
 MAX_DEFAULT_ROWS = 200
 RUNTIME_CONN_CONFIG: Dict[str, str] = {}

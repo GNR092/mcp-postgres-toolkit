@@ -1,5 +1,5 @@
 [project]
-name = "mcpservertools"
+name = "mcp-postgres-toolkit"
 version = "0.1.0"
 description = "MCP server for dynamic PostgreSQL exploration and safe read-only queries"
 readme = "README.md"
