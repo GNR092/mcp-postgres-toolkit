@@ -8,3 +8,6 @@ dependencies = [
     "psycopg2>=2.9.12",
     "fastmcp>=0.1.0",
 ]
+
+[project.scripts]
+mcp-postgres-toolkit = "main:run"

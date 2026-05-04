@@ -692,5 +692,10 @@ def count_rows(
         conn.close()
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Punto de entrada CLI del servidor MCP."""
     app.run()
+
+
+if __name__ == "__main__":
+    run()

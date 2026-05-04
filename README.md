@@ -32,7 +32,7 @@ uv sync
 ## Ejecucion
 
 ```bash
-python main.py
+mcp-postgres-toolkit
 ```
 
 ## Configuracion de conexion (runtime)
