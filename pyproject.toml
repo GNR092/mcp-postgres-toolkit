@@ -1,0 +1,10 @@
+[project]
+name = "mcpservertools"
+version = "0.1.0"
+description = "MCP server for dynamic PostgreSQL exploration and safe read-only queries"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "psycopg2>=2.9.12",
+    "fastmcp>=0.1.0",
+]
