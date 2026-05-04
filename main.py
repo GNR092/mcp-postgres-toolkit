@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 import psycopg2
 from fastmcp import FastMCP
 from psycopg2.extras import RealDictCursor
+from psycopg2 import sql
 
 app = FastMCP("mcpservertools")
 ACTIVE_DATABASE: Optional[str] = None
@@ -17,6 +18,18 @@ SENSITIVE_COLUMN_PATTERNS = [
     r"secret",
     r"api[_-]?key",
     r"firma",
+]
+DANGEROUS_SQL_PATTERNS = [
+    r"\bdrop\b",
+    r"\balter\b",
+    r"\btruncate\b",
+    r"\binsert\b",
+    r"\bupdate\b",
+    r"\bdelete\b",
+    r"\bgrant\b",
+    r"\brevoke\b",
+    r"\bcreate\b",
+    r"\bcomment\b",
 ]
 
 
@@ -55,6 +68,25 @@ def _mask_sensitive_rows(rows: list[Dict[str, Any]], mask: str = "***") -> list[
                 masked_row[key] = value
         masked_rows.append(masked_row)
     return masked_rows
+
+
+def _validate_single_statement(query: str) -> None:
+    """Valida que la consulta sea una sola sentencia SQL."""
+    normalized = query.strip().rstrip(";")
+    if ";" in normalized:
+        raise ValueError("Solo se permite una sentencia SQL por consulta.")
+
+
+def _validate_read_only_sql(query: str) -> None:
+    """Valida que la consulta sea de solo lectura y sin keywords peligrosas."""
+    normalized = query.strip().lower()
+    if not (normalized.startswith("select") or normalized.startswith("with")):
+        raise ValueError("Solo se permiten consultas de lectura (SELECT/WITH).")
+
+    if any(re.search(pattern, normalized) for pattern in DANGEROUS_SQL_PATTERNS):
+        raise ValueError("La consulta contiene keywords bloqueadas por seguridad.")
+
+    _validate_single_statement(query)
 
 
 def get_db_connection(database: Optional[str] = None):
@@ -216,12 +248,7 @@ def run_query(query: str, database: Optional[str] = None) -> Dict[str, Any]:
     Raises:
         ValueError: Si la consulta no inicia con SELECT.
     """
-    normalized = query.strip().lower().rstrip(";")
-    if not normalized.startswith("select"):
-        raise ValueError("Solo se permiten consultas SELECT.")
-
-    if ";" in normalized:
-        raise ValueError("Solo se permite una sentencia SQL por consulta.")
+    _validate_read_only_sql(query)
 
     target_database = _resolve_database(database)
     conn = get_db_connection(database=target_database)
@@ -233,6 +260,51 @@ def run_query(query: str, database: Optional[str] = None) -> Dict[str, Any]:
             masked_rows = _mask_sensitive_rows(limited_rows)
         return {
             "database": target_database,
+            "row_count": len(rows),
+            "rows": masked_rows,
+            "rows_limited": len(rows) > MAX_DEFAULT_ROWS,
+            "masked_sensitive_fields": True,
+        }
+    finally:
+        conn.close()
+
+
+@app.tool
+def run_query_safe(
+    query: str,
+    params: Optional[list[Any]] = None,
+    database: Optional[str] = None,
+    timeout_ms: int = 15000,
+) -> Dict[str, Any]:
+    """
+    Ejecuta una consulta parametrizada de solo lectura con timeout.
+
+    Args:
+        query: Consulta SQL SELECT/WITH.
+        params: Parametros para placeholders (%s).
+        database: Base destino opcional.
+        timeout_ms: Timeout por consulta en milisegundos.
+
+    Returns:
+        Diccionario con filas, metadatos y estado de enmascarado.
+    """
+    _validate_read_only_sql(query)
+    target_database = _resolve_database(database)
+    safe_timeout = max(1000, min(timeout_ms, 120000))
+
+    conn = get_db_connection(database=target_database)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = %s", (safe_timeout,))
+                cur.execute(query, params or [])
+                rows = cur.fetchall()
+                limited_rows = rows[:MAX_DEFAULT_ROWS]
+                masked_rows = _mask_sensitive_rows(limited_rows)
+
+        return {
+            "database": target_database,
+            "timeout_ms": safe_timeout,
             "row_count": len(rows),
             "rows": masked_rows,
             "rows_limited": len(rows) > MAX_DEFAULT_ROWS,
@@ -308,6 +380,82 @@ def list_tables(schema: str = "public", database: Optional[str] = None) -> Dict[
             "database": target_database,
             "schema": schema,
             "tables": [row["table_name"] for row in rows],
+        }
+    finally:
+        conn.close()
+
+
+@app.tool
+def list_schemas(database: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Lista esquemas disponibles excluyendo internos de PostgreSQL.
+    """
+    target_database = _resolve_database(database)
+    conn = get_db_connection(database=target_database)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name NOT IN ('information_schema')
+                  AND schema_name NOT LIKE 'pg_%'
+                ORDER BY schema_name;
+                """
+            )
+            rows = cur.fetchall()
+
+        return {
+            "database": target_database,
+            "schemas": [row["schema_name"] for row in rows],
+        }
+    finally:
+        conn.close()
+
+
+@app.tool
+def describe_foreign_keys(
+    table_name: str,
+    schema: str = "public",
+    database: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Lista llaves foraneas de una tabla y su referencia.
+    """
+    target_database = _resolve_database(database)
+    conn = get_db_connection(database=target_database)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    tc.constraint_name,
+                    kcu.column_name,
+                    ccu.table_schema AS foreign_table_schema,
+                    ccu.table_name AS foreign_table_name,
+                    ccu.column_name AS foreign_column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage ccu
+                  ON ccu.constraint_name = tc.constraint_name
+                 AND ccu.table_schema = tc.table_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY'
+                  AND tc.table_schema = %s
+                  AND tc.table_name = %s
+                ORDER BY tc.constraint_name, kcu.ordinal_position;
+                """,
+                (schema, table_name),
+            )
+            rows = cur.fetchall()
+
+        return {
+            "database": target_database,
+            "schema": schema,
+            "table": table_name,
+            "foreign_keys": rows,
+            "foreign_key_count": len(rows),
         }
     finally:
         conn.close()
@@ -458,6 +606,87 @@ def search_tables(pattern: str, schema: str = "public", database: Optional[str] 
             "schema": schema,
             "pattern": like_pattern,
             "matches": [row["table_name"] for row in rows],
+        }
+    finally:
+        conn.close()
+
+
+@app.tool
+def explain_query(
+    query: str,
+    analyze: bool = False,
+    params: Optional[list[Any]] = None,
+    database: Optional[str] = None,
+    timeout_ms: int = 15000,
+) -> Dict[str, Any]:
+    """
+    Obtiene plan de ejecucion de una consulta de lectura.
+    """
+    _validate_read_only_sql(query)
+    target_database = _resolve_database(database)
+    safe_timeout = max(1000, min(timeout_ms, 120000))
+    prefix = "EXPLAIN (ANALYZE, FORMAT JSON) " if analyze else "EXPLAIN (FORMAT JSON) "
+
+    conn = get_db_connection(database=target_database)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = %s", (safe_timeout,))
+                cur.execute(prefix + query, params or [])
+                plan_row = cur.fetchone()
+
+        return {
+            "database": target_database,
+            "analyze": analyze,
+            "timeout_ms": safe_timeout,
+            "plan": plan_row["QUERY PLAN"] if plan_row else None,
+        }
+    finally:
+        conn.close()
+
+
+@app.tool
+def count_rows(
+    table_name: str,
+    schema: str = "public",
+    where: Optional[str] = None,
+    params: Optional[list[Any]] = None,
+    database: Optional[str] = None,
+    timeout_ms: int = 15000,
+) -> Dict[str, Any]:
+    """
+    Cuenta filas de una tabla con filtro opcional.
+    """
+    target_database = _resolve_database(database)
+    safe_timeout = max(1000, min(timeout_ms, 120000))
+    base_query = sql.SQL("SELECT COUNT(*) AS total FROM {}.{}").format(
+        sql.Identifier(schema),
+        sql.Identifier(table_name),
+    )
+
+    if where:
+        _validate_single_statement(where)
+        if any(re.search(pattern, where.lower()) for pattern in DANGEROUS_SQL_PATTERNS):
+            raise ValueError("El filtro WHERE contiene keywords bloqueadas por seguridad.")
+        final_query = base_query + sql.SQL(" WHERE ") + sql.SQL(where)
+    else:
+        final_query = base_query
+
+    conn = get_db_connection(database=target_database)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = %s", (safe_timeout,))
+                cur.execute(final_query, params or [])
+                row = cur.fetchone()
+
+        return {
+            "database": target_database,
+            "schema": schema,
+            "table": table_name,
+            "where": where,
+            "total": row["total"] if row else 0,
+            "timeout_ms": safe_timeout,
         }
     finally:
         conn.close()
