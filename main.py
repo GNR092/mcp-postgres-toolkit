@@ -694,7 +694,10 @@ def count_rows(
 
 def run() -> None:
     """Punto de entrada CLI del servidor MCP."""
-    app.run()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
