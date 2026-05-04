@@ -1,11 +1,14 @@
 import os
 import re
+import json
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import psycopg2
 from fastmcp import FastMCP
 from psycopg2.extras import RealDictCursor
 from psycopg2 import sql
+from cryptography.fernet import Fernet, InvalidToken
 
 app = FastMCP("mcp-postgres-toolkit")
 ACTIVE_DATABASE: Optional[str] = None
@@ -31,6 +34,7 @@ DANGEROUS_SQL_PATTERNS = [
     r"\bcreate\b",
     r"\bcomment\b",
 ]
+CONNECTIONS_FILE = Path.home() / ".config" / "mcp-postgres-toolkit" / "connections.json"
 
 
 def _env(*keys: str, default: Optional[str] = None) -> Optional[str]:
@@ -48,6 +52,50 @@ def _cfg(primary_key: str, *env_keys: str, default: Optional[str] = None) -> Opt
     if runtime_value:
         return runtime_value
     return _env(*env_keys, default=default)
+
+
+def _ensure_connections_dir() -> None:
+    """Crea el directorio de configuracion local si no existe."""
+    CONNECTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _get_fernet() -> Fernet:
+    """Construye el cifrador a partir de MCP_MASTER_KEY."""
+    key = _env("MCP_MASTER_KEY")
+    if not key:
+        raise ValueError("Falta MCP_MASTER_KEY para guardar o usar conexiones persistentes.")
+    try:
+        return Fernet(key.encode("utf-8"))
+    except Exception as exc:
+        raise ValueError("MCP_MASTER_KEY no es valido para Fernet.") from exc
+
+
+def _read_connections_store() -> Dict[str, Any]:
+    """Carga el almacén de conexiones cifradas desde disco."""
+    if not CONNECTIONS_FILE.exists():
+        return {"connections": {}}
+
+    with CONNECTIONS_FILE.open("r", encoding="utf-8") as fp:
+        data = json.load(fp)
+    if "connections" not in data or not isinstance(data["connections"], dict):
+        return {"connections": {}}
+    return data
+
+
+def _write_connections_store(data: Dict[str, Any]) -> None:
+    """Persiste el almacén de conexiones en disco."""
+    _ensure_connections_dir()
+    with CONNECTIONS_FILE.open("w", encoding="utf-8") as fp:
+        json.dump(data, fp, ensure_ascii=True, indent=2)
+
+
+def _decrypt_connection_payload(encrypted_password: str) -> str:
+    """Descifra una contrasena previamente almacenada."""
+    fernet = _get_fernet()
+    try:
+        return fernet.decrypt(encrypted_password.encode("utf-8")).decode("utf-8")
+    except InvalidToken as exc:
+        raise ValueError("No se pudo descifrar la contrasena: revisa MCP_MASTER_KEY.") from exc
 
 
 def _is_sensitive_column(column_name: str) -> bool:
@@ -231,6 +279,108 @@ def get_connection_config_status() -> Dict[str, Any]:
         or RUNTIME_CONN_CONFIG.get("default_database")
         or _env("DB_NAME", "PGDATABASE"),
     }
+
+
+@app.tool
+def save_connection(
+    alias: str,
+    host: str,
+    user: str,
+    password: str,
+    port: str = "5432",
+    default_database: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Guarda un perfil de conexion cifrado en disco.
+
+    Requiere MCP_MASTER_KEY para cifrar la contrasena.
+    """
+    fernet = _get_fernet()
+    store = _read_connections_store()
+    encrypted_password = fernet.encrypt(password.encode("utf-8")).decode("utf-8")
+
+    store["connections"][alias] = {
+        "host": host,
+        "user": user,
+        "port": str(port),
+        "default_database": default_database,
+        "password": encrypted_password,
+    }
+    _write_connections_store(store)
+
+    return {
+        "saved": True,
+        "alias": alias,
+        "host": host,
+        "user": user,
+        "port": str(port),
+        "default_database": default_database,
+        "store_file": str(CONNECTIONS_FILE),
+    }
+
+
+@app.tool
+def list_connections() -> Dict[str, Any]:
+    """Lista aliases de conexion guardados sin exponer secretos."""
+    store = _read_connections_store()
+    items = []
+    for alias, cfg in sorted(store["connections"].items()):
+        items.append(
+            {
+                "alias": alias,
+                "host": cfg.get("host"),
+                "user": cfg.get("user"),
+                "port": cfg.get("port"),
+                "default_database": cfg.get("default_database"),
+            }
+        )
+
+    return {
+        "connections": items,
+        "count": len(items),
+        "store_file": str(CONNECTIONS_FILE),
+    }
+
+
+@app.tool
+def use_connection(alias: str) -> Dict[str, Any]:
+    """Carga un perfil guardado y lo activa en memoria para la sesion MCP."""
+    global ACTIVE_DATABASE
+
+    store = _read_connections_store()
+    cfg = store["connections"].get(alias)
+    if not cfg:
+        raise ValueError(f"No existe conexion guardada con alias '{alias}'.")
+
+    password = _decrypt_connection_payload(cfg["password"])
+    RUNTIME_CONN_CONFIG["host"] = cfg["host"]
+    RUNTIME_CONN_CONFIG["user"] = cfg["user"]
+    RUNTIME_CONN_CONFIG["password"] = password
+    RUNTIME_CONN_CONFIG["port"] = str(cfg.get("port", "5432"))
+
+    if cfg.get("default_database"):
+        RUNTIME_CONN_CONFIG["default_database"] = cfg["default_database"]
+        ACTIVE_DATABASE = cfg["default_database"]
+
+    return {
+        "active_alias": alias,
+        "host": RUNTIME_CONN_CONFIG["host"],
+        "port": RUNTIME_CONN_CONFIG["port"],
+        "user": RUNTIME_CONN_CONFIG["user"],
+        "active_database": ACTIVE_DATABASE or RUNTIME_CONN_CONFIG.get("default_database"),
+    }
+
+
+@app.tool
+def remove_connection(alias: str) -> Dict[str, Any]:
+    """Elimina un alias de conexion persistente."""
+    store = _read_connections_store()
+    if alias not in store["connections"]:
+        raise ValueError(f"No existe conexion guardada con alias '{alias}'.")
+
+    del store["connections"][alias]
+    _write_connections_store(store)
+    return {"removed": True, "alias": alias}
 
 
 @app.tool

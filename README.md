@@ -54,22 +54,33 @@ Despues puedes consultar:
 
 - `set_connection_config`
 - `get_connection_config_status`
+- `save_connection`
+- `list_connections`
+- `use_connection`
+- `remove_connection`
 - `list_databases`
 - `get_active_database`
 - `connect_database`
+- `list_schemas`
 - `list_tables`
 - `search_tables`
 - `describe_table`
+- `describe_foreign_keys`
 - `sample_table`
 - `run_query`
+- `run_query_safe`
+- `explain_query`
+- `count_rows`
 
 ## Seguridad
 
 - `run_query` permite solo `SELECT`.
 - Se bloquean multiples sentencias en una sola consulta.
 - Campos sensibles se devuelven enmascarados (`***`) en resultados.
+- Las conexiones persistentes guardan la contrasena cifrada con `MCP_MASTER_KEY`.
 
 ## Notas
 
 - La configuracion de conexion en runtime vive mientras el proceso MCP este encendido.
 - Si reinicias el servidor, vuelve a ejecutar `set_connection_config`.
+- Si usas `save_connection`, define `MCP_MASTER_KEY` en el entorno del servidor.
